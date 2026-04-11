@@ -1,26 +1,38 @@
 function Invoke-ListCippQueue {
     <#
     .FUNCTIONALITY
-        Entrypoint
+        Entrypoint,AnyTenant
     .ROLE
         CIPP.Core.Read
     #>
-    param($Request = $null, $TriggerMetadata = $null)
+    param($Request = $null, $TriggerMetadata = $null, $Reference = $null, $QueueId = $null)
 
     if ($Request) {
-        $APIName = $TriggerMetadata.FunctionName
-        Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
-        # Write to the Azure Functions log stream.
-        Write-Host 'PowerShell HTTP trigger function processed a request.'
+        $APIName = $Request.Params.CIPPEndpoint
+        Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
     }
+
+    $QueueId = $Request.Query.QueueId ?? $QueueId
+    $Reference = $Request.Query.Reference ?? $Reference
 
     $CippQueue = Get-CippTable -TableName 'CippQueue'
     $CippQueueTasks = Get-CippTable -TableName 'CippQueueTasks'
-    $CippQueueData = Get-CIPPAzDataTableEntity @CippQueue | Where-Object { ($_.Timestamp.DateTime) -ge (Get-Date).ToUniversalTime().AddHours(-3) } | Sort-Object -Property Timestamp -Descending
+    $3HoursAgo = (Get-Date).ToUniversalTime().AddHours(-3).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+    if ($QueueId) {
+        $SafeQueueId = ConvertTo-CIPPODataFilterValue -Value $QueueId -Type String
+        $Filter = "PartitionKey eq 'CippQueue' and RowKey eq '$SafeQueueId'"
+    } elseif ($Reference) {
+        $SafeReference = ConvertTo-CIPPODataFilterValue -Value $Reference -Type String
+        $Filter = "PartitionKey eq 'CippQueue' and Reference eq '$SafeReference' and Timestamp ge datetime'$3HoursAgo'"
+    } else {
+        $Filter = "PartitionKey eq 'CippQueue' and Timestamp ge datetime'$3HoursAgo'"
+    }
+
+    $CippQueueData = Get-CIPPAzDataTableEntity @CippQueue -Filter $Filter | Sort-Object -Property Timestamp -Descending
 
     $QueueData = foreach ($Queue in $CippQueueData) {
-        $Tasks = Get-CIPPAzDataTableEntity @CippQueueTasks -Filter "QueueId eq '$($Queue.RowKey)'" | Where-Object { $_.Name } | Select-Object Timestamp, Name, Status
+        $Tasks = Get-CIPPAzDataTableEntity @CippQueueTasks -Filter "PartitionKey eq 'Task' and QueueId eq '$($Queue.RowKey)'" | Where-Object { $_.Name } | Select-Object @{n = 'Timestamp'; exp = { $_.Timestamp } }, Name, Status
         $TaskStatus = @{}
         $Tasks | Group-Object -Property Status | ForEach-Object {
             $TaskStatus.$($_.Name) = $_.Count
@@ -56,7 +68,7 @@ function Invoke-ListCippQueue {
             PercentComplete = [math]::Round(((($TotalCompleted + $TotalFailed) / $Queue.TotalTasks) * 100), 1)
             PercentFailed   = [math]::Round((($TotalFailed / $Queue.TotalTasks) * 100), 1)
             PercentRunning  = [math]::Round((($TotalRunning / $Queue.TotalTasks) * 100), 1)
-            Tasks           = @($Tasks)
+            Tasks           = @($Tasks | Sort-Object -Descending Timestamp)
             Status          = $Queue.Status
             Timestamp       = $Queue.Timestamp
         }
@@ -64,7 +76,7 @@ function Invoke-ListCippQueue {
     }
 
     if ($request) {
-        Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        return ([HttpResponseContext]@{
                 StatusCode = [HttpStatusCode]::OK
                 Body       = @($QueueData)
             })
